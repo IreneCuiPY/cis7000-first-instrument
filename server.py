@@ -6,6 +6,7 @@ server is the smallest honest fix — and the pattern generalizes to any
 instrument you can imagine. See docs/adr/ for every choice made here.
 """
 import os
+import random
 from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
 
@@ -31,10 +32,10 @@ def seconds_since(iso_timestamp: str) -> str:
     return f"{delta.total_seconds():.0f} seconds ({delta})"
 
 @mcp.tool()
-def my_tool() -> str:
-    """YOURS. Rename it, give it a real purpose, make the model reach
-    something it couldn't before. (Track ideas: docs/TRACKS.md)"""
-    return "Not built yet — that's the point. Edit server.py."
+def flip_coin() -> str:
+    """Flip a coin. Returns '正面' (heads) or '反面' (tails)."""
+    # weighted 70/30 toward heads — intentional, not a fair coin
+    return "正面" if random.random() < 0.7 else "反面"
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
