@@ -9,10 +9,12 @@ Identity (retrofit, following your-protected-notes' guide, adapted for
 Neon Auth's Better Auth provider instead of Stack):
   guest — no (or missing) Authorization header: you share the commons
           (questions with user_id IS NULL) — the original 15 seed
-          questions, plus anything anyone adds as a guest.
+          questions. Guests are read-only on the bank itself: add_question
+          requires signing in, so the commons no longer grows from guest
+          calls — only from the owner inserting a row directly.
   user  — a verified Neon Auth identity: you see the commons PLUS your
-          own private questions; add_question is the only thing that
-          tells the two apart (your new questions are yours alone).
+          own private questions; your own questions via add_question are
+          private to you alone.
 "review progress" (question_reviews) is tracked per-identity, never on
 the question row itself — otherwise one user reviewing a shared commons
 question would mark it "reviewed" for every guest and every other user.
@@ -195,7 +197,7 @@ def user_status(ctx: Context) -> str:
     """Who does this server think you are? Always available, in every mode."""
     user_id, email = current_identity(ctx)
     if user_id is None:
-        return "guest — 你能看到并添加公共题库(commons);复习进度算在 guest commons 名下,人人共享。登录后可拥有自己的私有题。"
+        return "guest — 你能看到公共题库(commons)、看提示和答案、标记复习(算在 guest commons 名下,人人共享);但不能添加新题 — 添加题目需要先登录,登录后新题是你自己的私有题。"
     return f"user — 已登录为 {email or user_id}。你能看到公共题库 + 自己的私有题;复习进度只属于你自己。"
 
 @mcp.tool()
@@ -314,11 +316,13 @@ def mark_reviewed(question_id: int, ctx: Context) -> str:
 @db_errors
 def add_question(category: str, question: str, hint: str, answer: str = None, ctx: Context = None) -> str:
     """Add a new question to the question bank. category must be 'sde'
-    or 'quant'. Added as a guest -> goes into the shared commons; added
-    while signed in -> private to you alone."""
+    or 'quant'. Guests can't add questions — sign in first; questions
+    you add while signed in are private to you alone."""
+    user_id, _ = current_identity(ctx)
+    if user_id is None:
+        return "添加题目需要先登录 — 登录后你添加的题目会是你自己的私有题。"
     if category not in ("sde", "quant"):
         return "category 必须是 'sde' 或 'quant'。"
-    user_id, _ = current_identity(ctx)
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -327,8 +331,7 @@ def add_question(category: str, question: str, hint: str, answer: str = None, ct
                 (category, question, hint, answer, user_id),
             )
             (new_id,) = cur.fetchone()
-    shelf = "你的私有题库" if user_id else "公共题库(commons)"
-    return f"已添加题目,id={new_id}(加入{shelf})。"
+    return f"已添加题目,id={new_id}(私有,仅你可见)。"
 
 @mcp.tool()
 @db_errors
