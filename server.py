@@ -4,15 +4,30 @@ Why time? Ask your Claude "how long have we been talking?" WITHOUT this
 connected. It can only guess: no clock lives in a context window. This
 server is the smallest honest fix — and the pattern generalizes to any
 instrument you can imagine. See docs/adr/ for every choice made here.
+
+Identity (retrofit, following your-protected-notes' guide, adapted for
+Neon Auth's Better Auth provider instead of Stack):
+  guest — no (or missing) Authorization header: you share the commons
+          (questions with user_id IS NULL) — the original 15 seed
+          questions, plus anything anyone adds as a guest.
+  user  — a verified Neon Auth identity: you see the commons PLUS your
+          own private questions; add_question is the only thing that
+          tells the two apart (your new questions are yours alone).
+"review progress" (question_reviews) is tracked per-identity, never on
+the question row itself — otherwise one user reviewing a shared commons
+question would mark it "reviewed" for every guest and every other user.
 """
 import functools
 import os
 import random
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
+import jwt as pyjwt
 import psycopg
-from mcp.server.fastmcp import FastMCP
+from jwt import PyJWKClient
+from mcp.server.fastmcp import Context, FastMCP
 
 mcp = FastMCP(
     "your-first-instrument",
@@ -28,6 +43,22 @@ if not DATABASE_URL:
         "development (see `neon link`), or Render's environment settings "
         "in production."
     )
+
+# Neon Auth / Better Auth: unlike the Stack provider, there is no separate
+# project id — issuer AND audience are both the origin (scheme + host) of
+# the JWKS URL itself (confirmed against Neon's JWT-plugin docs). Signing
+# algorithm is fixed to EdDSA (Ed25519) and cannot be changed on the
+# managed service.
+#
+# NEON_AUTH_BASE_URL (the Auth -> Configuration URL) is the primary config:
+# the JWKS URL is derived from it. NEON_AUTH_JWKS_URL is kept only as an
+# optional fallback for when BASE_URL isn't set (e.g. a legacy Stack
+# project that only has a JWKS URL to give).
+NEON_AUTH_BASE_URL = os.environ.get("NEON_AUTH_BASE_URL", "").rstrip("/")
+JWKS_URL = (
+    f"{NEON_AUTH_BASE_URL}/.well-known/jwks.json" if NEON_AUTH_BASE_URL
+    else os.environ.get("NEON_AUTH_JWKS_URL")
+)
 
 SEED_QUESTIONS = [
     ("sde", "Two Sum: 给一个整数数组和一个目标值,找出数组中两个数之和等于目标值的下标。", "用哈希表存已遍历过的数字,一次遍历完成。"),
@@ -65,7 +96,10 @@ def get_connection():
 
 def db_errors(fn):
     """Turn connection/query failures into a returned error string
-    instead of letting them crash the server."""
+    instead of letting them crash the server. Auth errors (bad/garbled
+    tokens, raised from current_identity as plain jwt exceptions) are
+    NOT psycopg/ConnectionError, so they pass through uncaught — an
+    invalid token must surface as a loud error, never a silent guest."""
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
@@ -87,8 +121,20 @@ def init_db():
                     hint TEXT,
                     answer TEXT,
                     reviewed BOOLEAN NOT NULL DEFAULT FALSE,
-                    created_at TIMESTAMP NOT NULL DEFAULT now()
+                    created_at TIMESTAMP NOT NULL DEFAULT now(),
+                    user_id TEXT   -- NULL = shared commons (migration 2026-10-15)
                 )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS question_reviews (
+                    question_id  INTEGER NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+                    user_id      TEXT,
+                    reviewed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS question_reviews_unique
+                    ON question_reviews (question_id, COALESCE(user_id, ''))
             """)
             cur.execute("SELECT count(*) FROM questions")
             (count,) = cur.fetchone()
@@ -99,6 +145,58 @@ def init_db():
                 )
 
 init_db()
+
+# ---------------------------------------------------------------- identity
+def current_identity(ctx: Context):
+    """Resolve the caller: (user_id, email) or (None, None) for a guest.
+
+    ABSENT token  -> guest (a mode, not an error).
+    INVALID token -> raises. An invalid credential must never silently
+                     degrade to guest — that would hide broken auth
+                     (expired token, wrong JWKS URL, clock skew) as
+                     working anonymity, misfiling writes into the
+                     commons while the caller believes they're private.
+    """
+    request = getattr(ctx.request_context, "request", None)  # starlette Request under streamable-http
+    auth = request.headers.get("authorization", "") if request is not None else ""
+    if not auth.lower().startswith("bearer "):
+        return None, None
+    token = auth.split(None, 1)[1]
+    if token == "guest-no-shelf":      # the declared-guest credential (auth.py GUEST_TOKEN)
+        return None, None              # chosen commons — a mode, never an error
+
+    if not JWKS_URL:
+        raise RuntimeError(
+            "No auth variables set — NEON_AUTH_BASE_URL (Managed Better Auth; "
+            "see COURSE-STEPS step 2) or NEON_AUTH_JWKS_URL (fallback)."
+        )
+
+    # Better Auth / Neon Auth: no project id. issuer == audience == the
+    # origin (scheme + host) of the JWKS URL itself.
+    origin = urlparse(JWKS_URL)
+    expected = f"{origin.scheme}://{origin.netloc}"
+
+    signing_key = PyJWKClient(JWKS_URL).get_signing_key_from_jwt(token)
+    claims = pyjwt.decode(
+        token, signing_key.key, algorithms=["EdDSA"],
+        issuer=expected, audience=expected,
+    )
+    user_id = claims["sub"]                       # the identity, keyed on sub — never email
+    email = None
+    with get_connection() as conn:                # display only, never the key
+        with conn.cursor() as cur:
+            cur.execute('SELECT email FROM neon_auth."user" WHERE id::text = %s', (user_id,))
+            row = cur.fetchone()
+            email = row[0] if row else None
+    return user_id, email
+
+@mcp.tool()
+def user_status(ctx: Context) -> str:
+    """Who does this server think you are? Always available, in every mode."""
+    user_id, email = current_identity(ctx)
+    if user_id is None:
+        return "guest — 你能看到并添加公共题库(commons);复习进度算在 guest commons 名下,人人共享。登录后可拥有自己的私有题。"
+    return f"user — 已登录为 {email or user_id}。你能看到公共题库 + 自己的私有题;复习进度只属于你自己。"
 
 @mcp.tool()
 def current_time() -> str:
@@ -123,22 +221,27 @@ def flip_coin() -> str:
 
 @mcp.tool()
 @db_errors
-def get_random_question(category: str = None) -> dict:
-    """Get a random interview question. Optionally filter by category
-    ('sde' or 'quant'); an unrecognized or omitted category draws from
-    the full question bank. Returns id, category, and question text."""
+def get_random_question(category: str = None, ctx: Context = None) -> dict:
+    """Get a random interview question from the commons plus your own
+    private questions (guests get the commons only). Optionally filter
+    by category ('sde' or 'quant'); an unrecognized or omitted category
+    draws from your whole visible bank. Returns id, category, question."""
+    user_id, _ = current_identity(ctx)
     with get_connection() as conn:
         with conn.cursor() as cur:
             if category in ("sde", "quant"):
                 cur.execute(
                     "SELECT id, category, question FROM questions "
-                    "WHERE category = %s ORDER BY random() LIMIT 1",
-                    (category,),
+                    "WHERE (user_id IS NULL OR user_id = %s) AND category = %s "
+                    "ORDER BY random() LIMIT 1",
+                    (user_id, category),
                 )
             else:
                 cur.execute(
                     "SELECT id, category, question FROM questions "
-                    "ORDER BY random() LIMIT 1"
+                    "WHERE user_id IS NULL OR user_id = %s "
+                    "ORDER BY random() LIMIT 1",
+                    (user_id,),
                 )
             row = cur.fetchone()
     if row is None:
@@ -147,11 +250,16 @@ def get_random_question(category: str = None) -> dict:
 
 @mcp.tool()
 @db_errors
-def get_hint(question_id: int) -> str:
-    """Get the hint for a question by its id."""
+def get_hint(question_id: int, ctx: Context) -> str:
+    """Get the hint for a question by its id (must be visible to you:
+    commons, or your own private question)."""
+    user_id, _ = current_identity(ctx)
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT hint FROM questions WHERE id = %s", (question_id,))
+            cur.execute(
+                "SELECT hint FROM questions WHERE id = %s AND (user_id IS NULL OR user_id = %s)",
+                (question_id, user_id),
+            )
             row = cur.fetchone()
     if row is None:
         return f"未找到 id={question_id} 的题目。"
@@ -159,11 +267,16 @@ def get_hint(question_id: int) -> str:
 
 @mcp.tool()
 @db_errors
-def get_answer(question_id: int) -> str:
-    """Get the full answer for a question by its id, if one exists."""
+def get_answer(question_id: int, ctx: Context) -> str:
+    """Get the full answer for a question by its id, if one exists
+    (must be visible to you: commons, or your own private question)."""
+    user_id, _ = current_identity(ctx)
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT answer FROM questions WHERE id = %s", (question_id,))
+            cur.execute(
+                "SELECT answer FROM questions WHERE id = %s AND (user_id IS NULL OR user_id = %s)",
+                (question_id, user_id),
+            )
             row = cur.fetchone()
     if row is None:
         return f"未找到 id={question_id} 的题目。"
@@ -171,51 +284,74 @@ def get_answer(question_id: int) -> str:
 
 @mcp.tool()
 @db_errors
-def mark_reviewed(question_id: int) -> str:
-    """Mark a question as reviewed."""
+def mark_reviewed(question_id: int, ctx: Context) -> str:
+    """Mark a question as reviewed BY YOU. Review progress is tracked
+    per-identity (question_reviews), never on the question row itself —
+    a commons question you review does not become "reviewed" for anyone
+    else, guest or signed-in."""
+    user_id, _ = current_identity(ctx)
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE questions SET reviewed = TRUE WHERE id = %s RETURNING id",
-                (question_id,),
+                "SELECT id FROM questions WHERE id = %s AND (user_id IS NULL OR user_id = %s)",
+                (question_id, user_id),
             )
             if cur.fetchone() is None:
                 return f"未找到 id={question_id} 的题目。"
-            cur.execute("SELECT count(*) FROM questions WHERE reviewed = TRUE")
+            cur.execute(
+                "INSERT INTO question_reviews (question_id, user_id) VALUES (%s, %s) "
+                "ON CONFLICT (question_id, COALESCE(user_id, '')) DO UPDATE SET reviewed_at = now()",
+                (question_id, user_id),
+            )
+            cur.execute(
+                "SELECT count(*) FROM question_reviews WHERE user_id IS NOT DISTINCT FROM %s",
+                (user_id,),
+            )
             (reviewed_count,) = cur.fetchone()
     return f"题目{question_id}已标记为已复习,累计已复习{reviewed_count}题。"
 
 @mcp.tool()
 @db_errors
-def add_question(category: str, question: str, hint: str, answer: str = None) -> str:
-    """Add a new question to the question bank. category must be 'sde' or 'quant'."""
+def add_question(category: str, question: str, hint: str, answer: str = None, ctx: Context = None) -> str:
+    """Add a new question to the question bank. category must be 'sde'
+    or 'quant'. Added as a guest -> goes into the shared commons; added
+    while signed in -> private to you alone."""
     if category not in ("sde", "quant"):
         return "category 必须是 'sde' 或 'quant'。"
+    user_id, _ = current_identity(ctx)
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO questions (category, question, hint, answer) "
-                "VALUES (%s, %s, %s, %s) RETURNING id",
-                (category, question, hint, answer),
+                "INSERT INTO questions (category, question, hint, answer, user_id) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (category, question, hint, answer, user_id),
             )
             (new_id,) = cur.fetchone()
-    return f"已添加题目,id={new_id}。"
+    shelf = "你的私有题库" if user_id else "公共题库(commons)"
+    return f"已添加题目,id={new_id}(加入{shelf})。"
 
 @mcp.tool()
 @db_errors
-def get_quiz(n: int = 3) -> list:
-    """Get up to n randomly selected questions that have already been
-    reviewed, for a daily review quiz. Returns fewer than n if not enough
-    reviewed questions exist yet."""
+def get_quiz(n: int = 3, ctx: Context = None) -> list:
+    """Get up to n randomly selected questions, visible to you (commons
+    + your own), that YOU have already reviewed, for a daily review
+    quiz. Returns fewer than n if not enough reviewed questions exist."""
+    user_id, _ = current_identity(ctx)
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, category, question FROM questions "
-                "WHERE reviewed = TRUE ORDER BY random() LIMIT %s",
-                (n,),
+                "SELECT q.id, q.category, q.question FROM questions q "
+                "JOIN question_reviews r ON r.question_id = q.id "
+                "  AND r.user_id IS NOT DISTINCT FROM %s "
+                "WHERE q.user_id IS NULL OR q.user_id = %s "
+                "ORDER BY random() LIMIT %s",
+                (user_id, user_id, n),
             )
             rows = cur.fetchall()
     return [{"id": r[0], "category": r[1], "question": r[2]} for r in rows]
+
+from auth import register_oauth_routes  # OAuth AS endpoints — without this, claude.ai cannot sign in
+register_oauth_routes(mcp)
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
